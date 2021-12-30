@@ -142,31 +142,61 @@ function rhs(domain::Domain{T}) where {T}
     return Domain{T}(grids)
 end
 
+# TODO: Use `CartesianIndex` to simplify handling these regions.
+# Define them globally, near `lsh` and `nghostzones`.
 function get_ghosts(grid::Grid{T}, dir::Int, face::Int) where {T}
     if dir == 1
         if face == 1
-            return grid.array[(begin + nghosts[1] + 1):(begin + 2 * nghosts[1]), (begin + nghosts[2]):(end - nghosts[2])]
+            return grid.array[(begin + nghosts[1]):(begin + 2 * nghosts[1] - 1), (begin + nghosts[2]):(end - nghosts[2])]
         elseif face == 2
-            return grid.array[(end - 2 * nghosts[1]):(end - nghosts[1] - 1), (begin + nghosts[2]):(end - nghosts[2])]
+            return grid.array[(end - 2 * nghosts[1] + 1):(end - nghosts[1]), (begin + nghosts[2]):(end - nghosts[2])]
         end
     elseif dir == 2
         if face == 1
-            return grid.array[(begin + nghosts[1]):(end - nghosts[1]), (begin + nghosts[2] + 1):(begin + 2 * nghosts[2])]
+            return grid.array[(begin + nghosts[1]):(end - nghosts[1]), (begin + nghosts[2]):(begin + 2 * nghosts[2] - 1)]
         elseif face == 2
-            return grid.array[(begin + nghosts[1]):(end - nghosts[1]), (end - 2 * nghosts[2]):(end - nghosts[2] - 1)]
+            return grid.array[(begin + nghosts[1]):(end - nghosts[1]), (end - 2 * nghosts[2] + 1):(end - nghosts[2])]
         end
     end
 end
 
 function set_ghosts(grid::Grid{T}, ghosts11::Array{T,D}, ghosts12::Array{T,D}, ghosts21::Array{T,D}, ghosts22::Array{T,D}) where {T}
+    # Check region sizes
     @assert size(ghosts11) == (nghosts[1], size(grid.array, 2) - 2 * nghosts[2])
     @assert size(ghosts12) == (nghosts[1], size(grid.array, 2) - 2 * nghosts[2])
     @assert size(ghosts21) == (size(grid.array, 1) - 2 * nghosts[1], nghosts[2])
     @assert size(ghosts22) == (size(grid.array, 1) - 2 * nghosts[1], nghosts[2])
-    grid.array[begin:(begin + nghosts[1]), (begin + nghosts[2]):(end - nghosts[2])] .= ghosts11
-    grid.array[(end - nghosts[1]):end, (begin + nghosts[2]):(end - nghosts[2])] .= ghosts12
-    grid.array[(begin + nghosts[1]):(end - nghosts[1]), begin:(begin + nghosts[2])] .= ghosts21
-    grid.array[(begin + nghosts[1]):(end - nghosts[1]), (end - nghosts[2]):end] .= ghosts22
+    @assert size(@view grid.array[begin:(begin + nghosts[1] - 1), (begin + nghosts[2]):(end - nghosts[2])]) ==
+            (nghosts[1], size(grid.array, 2) - 2 * nghosts[2])
+    @assert size(@view grid.array[(end - nghosts[1] + 1):end, (begin + nghosts[2]):(end - nghosts[2])]) ==
+            (nghosts[1], size(grid.array, 2) - 2 * nghosts[2])
+    @assert size(@view grid.array[(begin + nghosts[1]):(end - nghosts[1]), begin:(begin + nghosts[2] - 1)]) ==
+            (size(grid.array, 1) - 2 * nghosts[1], nghosts[2])
+    @assert size(@view grid.array[(begin + nghosts[1]):(end - nghosts[1]), (end - nghosts[2] + 1):end]) ==
+            (size(grid.array, 1) - 2 * nghosts[1], nghosts[2])
+    # Set ghost zones
+    grid.array[begin:(begin + nghosts[1] - 1), (begin + nghosts[2]):(end - nghosts[2])] .= ghosts11
+    grid.array[(end - nghosts[1] + 1):end, (begin + nghosts[2]):(end - nghosts[2])] .= ghosts12
+    grid.array[(begin + nghosts[1]):(end - nghosts[1]), begin:(begin + nghosts[2] - 1)] .= ghosts21
+    grid.array[(begin + nghosts[1]):(end - nghosts[1]), (end - nghosts[2] + 1):end] .= ghosts22
+    # Fill in corners
+    # grid.array[begin:(begin + nghosts[1] - 1), begin:(begin + nghosts[2] - 1)] .= zero(T)
+    # grid.array[(end - nghosts[1] + 1):end, begin:(begin + nghosts[2] - 1)] .= zero(T)
+    # grid.array[begin:(begin + nghosts[1] - 1), (end - nghosts[2] + 1):end] .= zero(T)
+    # grid.array[(end - nghosts[1] + 1):end, (end - nghosts[2] + 1):end] .= zero(T)
+    for j in 1:nghosts[2], i in 1:nghosts[1]
+        grid.array[i, j] = zero(T)
+    end
+    for j in 1:nghosts[2], i in (lsh[1] - nghosts[1] + 1):lsh[1]
+        grid.array[i, j] = zero(T)
+    end
+    for j in (lsh[2] - nghosts[2] + 1):lsh[2], i in 1:nghosts[1]
+        grid.array[i, j] = zero(T)
+    end
+    for j in (lsh[2] - nghosts[2] + 1):lsh[2], i in (lsh[1] - nghosts[1] + 1):lsh[1]
+        grid.array[i, j] = zero(T)
+    end
+    # TODO: Do we need a copy here?
     return grid
 end
 
@@ -224,6 +254,9 @@ function main()
 
     dom = initialize_domain(U)
     dom = rk2(rhs′, dom, h)
+
+    # TODO: Use `yield` (?) to show a progress bar or something
+
     ma = maxabs(dom)
     println("maxabs=$ma")
 

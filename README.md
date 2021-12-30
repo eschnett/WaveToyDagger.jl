@@ -26,3 +26,7 @@ BenchmarkTools.Trial: 25 samples with 1 evaluation.
 
  Memory estimate: 10.38 MiB, allocs estimate: 198917.
 ```
+
+## Ideas
+
+- Use `DaggerGPU.jl` (does it work on non-CUDA GPUs?)
