@@ -7,6 +7,7 @@ using StaticArrays
 
 struct Future{T}
     thunk::Union{Thunk,Dagger.EagerThunk,Dagger.Chunk{T}}
+    # Enable this to serialize all calculations
     # Future{T}(x) where {T} = new{T}(Dagger.tochunk(get_result(T, x)))
 end
 get_result(::Type{T}, thunk::Thunk) where {T} = collect(thunk)::T
@@ -36,6 +37,11 @@ end
 
 const D = 2
 
+IND(i::SVector) = CartesianIndex(Tuple(i))
+VEC(i::CartesianIndex) = SVector(Tuple(i))
+
+const ones = SVector(1, 1)
+
 const npoints = SVector(256, 256)
 const ngrids = SVector(8, 8)
 const nghosts = SVector(1, 1)
@@ -45,52 +51,70 @@ const gsh = npoints + 2 * nghosts
 const lsh = npoints .÷ ngrids + 2 * nghosts
 lbnd(gpos::SVector{D,Int}) = (gpos .- 1) .* (lsh - 2 * nghosts) .+ 1
 
-const xmin = SVector(-1.0, -1.0)
-const xmax = SVector(+1.0, +1.0)
+# TODO: Introduce `local2global`, `global2local`
+
+const extr = IND(ones):IND(lsh)
+const intr = IND(ones + nghosts):IND(lsh - nghosts)
+function bnds(dirs::SVector{D,Int})
+    @assert all(-1 ≤ dir ≤ 1 for dir in dirs)
+    intrlo, intrhi = first(intr), last(intr)
+    lbnd = CartesianIndex(ntuple(d -> dirs[d] < 0 ? 1 : dirs[d] > 0 ? intrhi[d] + 1 : intrlo[d], D))
+    ubnd = CartesianIndex(ntuple(d -> dirs[d] < 0 ? intrlo[d] - 1 : dirs[d] > 0 ? lsh[d] : intrhi[d], D))
+    return lbnd:ubnd
+end
+function srcs(dirs::SVector{D,Int})
+    intrlo, intrhi = first(intr), last(intr)
+    lbnd = CartesianIndex(ntuple(d -> dirs[d] < 0 ? intrhi[d] - nghosts[d] + 1 : dirs[d] > 0 ? intrlo[d] : intrlo[d], D))
+    ubnd = CartesianIndex(ntuple(d -> dirs[d] < 0 ? intrhi[d] : dirs[d] > 0 ? intrlo[d] + nghosts[d] - 1 : intrhi[d], D))
+    return lbnd:ubnd
+end
+
+const xmin = SVector{D}(-1.0 for d in 1:D)
+const xmax = SVector{D}(+1.0 for d in 1:D)
 const dx = (xmax - xmin) / (gsh - 2 * nghosts .- 1)
 xcoord(ipos::SVector{D,Int}) = linterp(1 .+ nghosts, xmin, gsh + nghosts, xmax, ipos)
 
 ################################################################################
 
-struct Grid{T}
+struct Grid{D,T}
     array::Array{T,D}
     gpos::SVector{D,Int}
 end
 
-struct Domain{T}
-    grids::Array{Future{Grid{T}},D}
+struct Domain{D,T}
+    grids::Array{Future{Grid{D,T}},D}
 end
 
 # TODO: Introduce Base.map for Grid to combine linear operations
-function Base.:+(x::Grid{U}, y::Grid{U}) where {U}
+function Base.:+(x::Grid{D,U}, y::Grid{D,U}) where {D,U}
     @assert x.gpos == y.gpos
-    return Grid{U}(x.array + y.array, x.gpos)
+    return Grid{D,U}(x.array + y.array, x.gpos)
 end
-function Base.:*(a::T, x::Grid{U}) where {T,U}
+function Base.:*(a::T, x::Grid{D,U}) where {D,T,U}
     @assert T == eltype(U)
-    return Grid{U}(a * x.array, x.gpos)
+    return Grid{D,U}(a * x.array, x.gpos)
 end
 
 # TODO: Introduce Base.map for Domain to combine linear operations
-function Base.:+(x::Domain{U}, y::Domain{U}) where {U}
-    grids = Array{Future{Grid{U}},D}(undef, Tuple(ngrids))
+function Base.:+(x::Domain{D,U}, y::Domain{D,U}) where {D,U}
+    grids = Array{Future{Grid{D,U}},D}(undef, Tuple(ngrids))
     for gj in 1:ngrids[2], gi in 1:ngrids[1]
-        grids[gi, gj] = Future{Grid{U}}(Dagger.@spawn x.grids[gi, gj].thunk + y.grids[gi, gj].thunk)
+        grids[gi, gj] = Future{Grid{D,U}}(Dagger.@spawn x.grids[gi, gj].thunk + y.grids[gi, gj].thunk)
     end
-    return Domain{U}(grids)
+    return Domain{D,U}(grids)
 end
-function Base.:*(a::T, x::Domain{U}) where {T,U}
+function Base.:*(a::T, x::Domain{D,U}) where {D,T,U}
     @assert T == eltype(U)
-    grids = Array{Future{Grid{U}},D}(undef, Tuple(ngrids))
+    grids = Array{Future{Grid{D,U}},D}(undef, Tuple(ngrids))
     for gj in 1:ngrids[2], gi in 1:ngrids[1]
-        grids[gi, gj] = Future{Grid{U}}(Dagger.@spawn a * x.grids[gi, gj].thunk)
+        grids[gi, gj] = Future{Grid{D,U}}(Dagger.@spawn a * x.grids[gi, gj].thunk)
     end
-    return Domain{U}(grids)
+    return Domain{D,U}(grids)
 end
 
 ################################################################################
 
-function solution(t::T, x::SVector{D,T}) where {T}
+function solution(t::T, x::SVector{D,T}) where {D,T}
     ω = sqrt(T(D))
     u = cospi(ω * t) * sinpi(x[1]) * sinpi(x[2])
     ρ = -T(π) * ω * sinpi(ω * t) * sinpi(x[1]) * sinpi(x[2])
@@ -100,128 +124,95 @@ end
 
 ################################################################################
 
-function initialize_grid(::Type{U}, gpos::SVector{D,Int}) where {U}
+function initialize_grid(::Type{Grid{D,U}}, gpos::SVector{D,Int}) where {D,U}
     T = eltype(U)
     t = T(0)
     array = Array{U,D}(undef, Tuple(lsh))
-    for j in 1:lsh[2], i in 1:lsh[1]
-        ipos = lbnd(gpos) + SVector(i, j) .- 1
+    for i in extr
+        ipos = lbnd(gpos) + SVector(Tuple(i)) .- 1
         x = SVector{D,T}(xcoord(ipos))
-        array[i, j] = solution(t, x)
+        array[i] = solution(t, x)
     end
-    return Grid{U}(array, gpos)
+    return Grid{D,U}(array, gpos)
 end
 
-function initialize_domain(::Type{T}) where {T}
-    grids = Array{Future{Grid{T}},D}(undef, Tuple(ngrids))
+function initialize_domain(::Type{Domain{D,T}}) where {D,T}
+    grids = Array{Future{Grid{D,T}},D}(undef, Tuple(ngrids))
     for gj in 1:ngrids[2], gi in 1:ngrids[1]
-        grids[gi, gj] = Future{Grid{T}}(Dagger.@spawn initialize_grid(T, SVector(gi, gj)))
+        grids[gi, gj] = Future{Grid{D,T}}(Dagger.@spawn initialize_grid(Grid{D,T}, SVector(gi, gj)))
     end
-    return Domain{T}(grids)
+    return Domain{D,T}(grids)
 end
 
-function rhs(grid::Grid{U}) where {U}
+function rhs(grid::Grid{D,U}) where {U}
     array = Array{U,D}(undef, Tuple(lsh))
-    for j in (1 + nghosts[2]):(lsh[2] - nghosts[2]), i in (1 + nghosts[1]):(lsh[1] - nghosts[1])
-        u, ρ, vx, vy = grid.array[i, j]
+    di = SVector(CartesianIndex(1, 0), CartesianIndex(0, 1))
+    for i in intr
+        u, ρ, vx, vy = grid.array[i]
         u̇ = ρ
-        ρ̇ = (grid.array[i + 1, j][3] - grid.array[i - 1, j][3]) / 2dx[1] +
-             (grid.array[i, j + 1][4] - grid.array[i, j - 1][4]) / 2dx[2]
-        vẋ = (grid.array[i + 1, j][2] - grid.array[i - 1, j][2]) / 2dx[1]
-        vẏ = (grid.array[i, j + 1][3] - grid.array[i, j - 1][3]) / 2dx[2]
-        array[i, j] = SVector(u̇, ρ̇, vẋ, vẏ)
+        ρ̇ = (grid.array[i + di[1]][2 + 1] - grid.array[i - di[1]][2 + 1]) / 2dx[1] +
+             (grid.array[i + di[2]][2 + 2] - grid.array[i - di[2]][2 + 2]) / 2dx[2]
+        vẋ = (grid.array[i + di[1]][2] - grid.array[i - di[1]][2]) / 2dx[1]
+        vẏ = (grid.array[i + di[2]][2] - grid.array[i - di[2]][2]) / 2dx[2]
+        array[i] = SVector(u̇, ρ̇, vẋ, vẏ)
     end
-    return Grid{U}(array, grid.gpos)
+    return Grid{D,U}(array, grid.gpos)
 end
 
-function rhs(domain::Domain{T}) where {T}
-    grids = Array{Future{Grid{T}},D}(undef, Tuple(ngrids))
+function rhs(domain::Domain{D,T}) where {D,T}
+    grids = Array{Future{Grid{D,T}},D}(undef, Tuple(ngrids))
     for gj in 1:ngrids[2], gi in 1:ngrids[1]
-        grids[gi, gj] = Future{Grid{T}}(Dagger.@spawn rhs(domain.grids[gi, gj].thunk))
+        grids[gi, gj] = Future{Grid{D,T}}(Dagger.@spawn rhs(domain.grids[gi, gj].thunk))
     end
-    return Domain{T}(grids)
+    return Domain{D,T}(grids)
 end
 
-# TODO: Use `CartesianIndex` to simplify handling these regions.
-# Define them globally, near `lsh` and `nghostzones`.
-function get_ghosts(grid::Grid{T}, dir::Int, face::Int) where {T}
-    if dir == 1
-        if face == 1
-            return grid.array[(begin + nghosts[1]):(begin + 2 * nghosts[1] - 1), (begin + nghosts[2]):(end - nghosts[2])]
-        elseif face == 2
-            return grid.array[(end - 2 * nghosts[1] + 1):(end - nghosts[1]), (begin + nghosts[2]):(end - nghosts[2])]
-        end
-    elseif dir == 2
-        if face == 1
-            return grid.array[(begin + nghosts[1]):(end - nghosts[1]), (begin + nghosts[2]):(begin + 2 * nghosts[2] - 1)]
-        elseif face == 2
-            return grid.array[(begin + nghosts[1]):(end - nghosts[1]), (end - 2 * nghosts[2] + 1):(end - nghosts[2])]
-        end
-    end
-end
+get_ghosts(grid::Grid{D,T}, dirs::SVector{D,Int}) where {D,T} = grid.array[srcs(dirs)]
 
-function set_ghosts(grid::Grid{T}, ghosts11::Array{T,D}, ghosts12::Array{T,D}, ghosts21::Array{T,D}, ghosts22::Array{T,D}) where {T}
-    # Check region sizes
-    @assert size(ghosts11) == (nghosts[1], size(grid.array, 2) - 2 * nghosts[2])
-    @assert size(ghosts12) == (nghosts[1], size(grid.array, 2) - 2 * nghosts[2])
-    @assert size(ghosts21) == (size(grid.array, 1) - 2 * nghosts[1], nghosts[2])
-    @assert size(ghosts22) == (size(grid.array, 1) - 2 * nghosts[1], nghosts[2])
-    @assert size(@view grid.array[begin:(begin + nghosts[1] - 1), (begin + nghosts[2]):(end - nghosts[2])]) ==
-            (nghosts[1], size(grid.array, 2) - 2 * nghosts[2])
-    @assert size(@view grid.array[(end - nghosts[1] + 1):end, (begin + nghosts[2]):(end - nghosts[2])]) ==
-            (nghosts[1], size(grid.array, 2) - 2 * nghosts[2])
-    @assert size(@view grid.array[(begin + nghosts[1]):(end - nghosts[1]), begin:(begin + nghosts[2] - 1)]) ==
-            (size(grid.array, 1) - 2 * nghosts[1], nghosts[2])
-    @assert size(@view grid.array[(begin + nghosts[1]):(end - nghosts[1]), (end - nghosts[2] + 1):end]) ==
-            (size(grid.array, 1) - 2 * nghosts[1], nghosts[2])
-    # Set ghost zones
-    grid.array[begin:(begin + nghosts[1] - 1), (begin + nghosts[2]):(end - nghosts[2])] .= ghosts11
-    grid.array[(end - nghosts[1] + 1):end, (begin + nghosts[2]):(end - nghosts[2])] .= ghosts12
-    grid.array[(begin + nghosts[1]):(end - nghosts[1]), begin:(begin + nghosts[2] - 1)] .= ghosts21
-    grid.array[(begin + nghosts[1]):(end - nghosts[1]), (end - nghosts[2] + 1):end] .= ghosts22
-    # Fill in corners
-    # grid.array[begin:(begin + nghosts[1] - 1), begin:(begin + nghosts[2] - 1)] .= zero(T)
-    # grid.array[(end - nghosts[1] + 1):end, begin:(begin + nghosts[2] - 1)] .= zero(T)
-    # grid.array[begin:(begin + nghosts[1] - 1), (end - nghosts[2] + 1):end] .= zero(T)
-    # grid.array[(end - nghosts[1] + 1):end, (end - nghosts[2] + 1):end] .= zero(T)
-    for j in 1:nghosts[2], i in 1:nghosts[1]
-        grid.array[i, j] = zero(T)
+function set_ghosts!(grid::Grid{D,T}, ghosts::Array{Array{T,D},D}) where {D,T}
+    for dirsi in CartesianIndex(-1, -1):CartesianIndex(1, 1)
+        dirs = VEC(dirsi)
+        if !iszero(dirs)
+            # Check region sizes
+            @assert size(ghosts[IND(dirs .+ 2)]) == size(bnds(dirs))
+            @assert size(srcs(dirs)) == size(bnds(dirs))
+            # Set ghost zones
+            grid.array[bnds(dirs)] = ghosts[IND(dirs .+ 2)]
+        end
     end
-    for j in 1:nghosts[2], i in (lsh[1] - nghosts[1] + 1):lsh[1]
-        grid.array[i, j] = zero(T)
-    end
-    for j in (lsh[2] - nghosts[2] + 1):lsh[2], i in 1:nghosts[1]
-        grid.array[i, j] = zero(T)
-    end
-    for j in (lsh[2] - nghosts[2] + 1):lsh[2], i in (lsh[1] - nghosts[1] + 1):lsh[1]
-        grid.array[i, j] = zero(T)
-    end
-    # TODO: Do we need a copy here?
     return grid
 end
 
-function exchange_ghosts(domain::Domain{T}) where {T}
-    grids = Array{Future{Grid{T}},D}(undef, Tuple(ngrids))
-    for gj in 1:ngrids[2], gi in 1:ngrids[1]
-        ghosts11 = Future{Array{T,D}}(Dagger.@spawn get_ghosts(domain.grids[mod1(gi - 1, ngrids[1]), gj].thunk, 1, 2))
-        ghosts12 = Future{Array{T,D}}(Dagger.@spawn get_ghosts(domain.grids[mod1(gi + 1, ngrids[1]), gj].thunk, 1, 1))
-        ghosts21 = Future{Array{T,D}}(Dagger.@spawn get_ghosts(domain.grids[gi, mod1(gj - 1, ngrids[2])].thunk, 2, 2))
-        ghosts22 = Future{Array{T,D}}(Dagger.@spawn get_ghosts(domain.grids[gi, mod1(gj + 1, ngrids[2])].thunk, 2, 1))
-        grids[gi, gj] = Future{Grid{T}}(Dagger.@spawn set_ghosts(domain.grids[gi, gj].thunk, ghosts11.thunk, ghosts12.thunk,
-                                                                 ghosts21.thunk, ghosts22.thunk))
+function exchange_ghosts(domain::Domain{D,T}) where {D,T}
+    grids = Array{Future{Grid{D,T}},D}(undef, Tuple(ngrids))
+    for gi in IND(ones):IND(ngrids)
+        g = VEC(gi)
+        ghosts = Array{Future{Array{T,D}},D}(undef, ntuple(d -> 3, D))
+        for dirsi in CartesianIndex(-1, -1):CartesianIndex(1, 1)
+            dirs = VEC(dirsi)
+            if !iszero(dirs)
+                ghosts[IND(dirs .+ 2)] = Future{Array{T,D}}(Dagger.@spawn get_ghosts(domain.grids[IND(mod1.(g + dirs, ngrids))].thunk,
+                                                                                     dirs))
+            else
+                ghosts[IND(dirs .+ 2)] = Future{Array{T,D}}(Dagger.@spawn zeros(T, ntuple(d -> 0, D)))
+            end
+        end
+        grids[IND(g)] = Future{Grid{D,T}}(Dagger.@spawn set_ghosts!(domain.grids[IND(g)].thunk,
+                                                                    Array{T,D}[fetch(ghost) for ghost in ghosts]))
     end
-    return Domain{T}(grids)
+    return Domain{D,T}(grids)
 end
 
 ################################################################################
 
-function maxabs(grid::Grid{U}) where {U}
+function maxabs(grid::Grid{D,U}) where {D,U}
     maxabs′(u, v) = max.(abs.(u), abs.(v))
     return reduce(maxabs′, grid.array; init=zero(U))::U
 end
 
-function maxabs(domain::Domain{T}) where {T}
+function maxabs(domain::Domain{D,T}) where {D,T}
     thunks = Future{T}[]
+    @assert D == 2
     for gj in 1:ngrids[2], gi in 1:ngrids[1]
         push!(thunks, Future{T}(Dagger.@spawn maxabs(domain.grids[gi, gj].thunk)))
     end
@@ -251,14 +242,23 @@ function main()
     T = Float64
     U = SVector{4,T}
     h = minimum(dx) / 2
+    niters = 10
 
-    dom = initialize_domain(U)
-    dom = rk2(rhs′, dom, h)
+    println("Initial conditions...")
+    dom = initialize_domain(Domain{D,U})
+    dom = exchange_ghosts(dom)
+
+    for iter in 1:niters
+        println("Iteration $iter...")
+        dom = rk2(rhs′, dom, h)
+    end
 
     # TODO: Use `yield` (?) to show a progress bar or something
 
     ma = maxabs(dom)
     println("maxabs=$ma")
+
+    println("Done.")
 
     # logs = Dagger.get_logs!(log)
     # Dagger.show_plan(stdout, logs)
