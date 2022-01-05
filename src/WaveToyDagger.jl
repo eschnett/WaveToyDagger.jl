@@ -14,6 +14,7 @@ get_result(::Type{T}, thunk::Thunk) where {T} = collect(thunk)::T
 get_result(::Type{T}, thunk::Dagger.EagerThunk) where {T} = fetch(thunk)::T
 get_result(::Type{T}, thunk::Dagger.Chunk{T}) where {T} = collect(thunk)
 Base.fetch(f::Future{T}) where {T} = get_result(T, f.thunk)
+Base.wait(f::Future) = wait(f.thunk)
 
 # make_ready_future(value::T) where {T} = Future{T}(Some{T}(value))
 # # async(::Type{T}, thunk::Dagger.EagerThunk) = Future{T}(thunk)
@@ -84,6 +85,8 @@ end
 struct Domain{D,T}
     grids::Array{Future{Grid{D,T}},D}
 end
+
+Base.wait(dom::Domain) = wait.(dom.grids)
 
 # TODO: Introduce Base.map for Grid to combine linear operations
 function Base.:+(x::Grid{D,U}, y::Grid{D,U}) where {D,U}
@@ -250,7 +253,11 @@ function main()
 
     for iter in 1:niters
         println("Iteration $iter...")
+        dom′ = dom
         dom = rk2(rhs′, dom, h)
+
+        # Limit parallelism
+        wait(dom′)
     end
 
     # TODO: Use `yield` (?) to show a progress bar or something
