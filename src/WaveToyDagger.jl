@@ -10,23 +10,23 @@ struct Future{T}
     # Enable this to serialize all calculations
     # Future{T}(x) where {T} = new{T}(Dagger.tochunk(get_result(T, x)))
 end
+Future{T}(x::T) where {T} = Future{T}(Dagger.tochunk(x))
 get_result(::Type{T}, thunk::Thunk) where {T} = collect(thunk)::T
 get_result(::Type{T}, thunk::Dagger.EagerThunk) where {T} = fetch(thunk)::T
-get_result(::Type{T}, thunk::Dagger.Chunk{T}) where {T} = collect(thunk)
+get_result(::Type{T}, thunk::Dagger.Chunk{T}) where {T} = collect(thunk)::T
 Base.fetch(f::Future{T}) where {T} = get_result(T, f.thunk)
 Base.wait(f::Future) = wait(f.thunk)
 
-# make_ready_future(value::T) where {T} = Future{T}(Some{T}(value))
-# # async(::Type{T}, thunk::Dagger.EagerThunk) = Future{T}(thunk)
-# macro async(T, expr)
+# make_ready_future(value::T) where {T} = Future{T}(Dagger.tochunk(value))
+# macro future(T, exprs...)
+#     isempty(exprs) && error("Syntax: @future <type> {<option>} <expression>")
+#     opts = exprs[1:(end - 1)]
+#     expr = exprs[end]
 #     quote
-#         Future{$T}($(Dagger._par(expr; lazy=false)))
+#         task() = $(esc(expr))
+#         Future{$(esc(T))}(Dagger.spawn(task; $((esc(opt) for opt in opts)...)))
 #     end
 # end
-# 
-# f = @async Int (2 + 3)
-# @show typeof(f)
-# @show f
 
 ################################################################################
 
@@ -172,15 +172,16 @@ end
 
 get_ghosts(grid::Grid{D,T}, dirs::SVector{D,Int}) where {D,T} = grid.array[srcs(dirs)]
 
-function set_ghosts!(grid::Grid{D,T}, ghosts::Array{Array{T,D},D}) where {D,T}
+function set_ghosts!(grid::Grid{D,T}, ghosts::Array{Future{Array{T,D}},D}) where {D,T}
     for dirsi in CartesianIndex(-1, -1):CartesianIndex(1, 1)
         dirs = VEC(dirsi)
         if !iszero(dirs)
+            gh = fetch(ghosts[IND(dirs .+ 2)])
             # Check region sizes
-            @assert size(ghosts[IND(dirs .+ 2)]) == size(bnds(dirs))
+            @assert size(gh) == size(bnds(dirs))
             @assert size(srcs(dirs)) == size(bnds(dirs))
             # Set ghost zones
-            grid.array[bnds(dirs)] = ghosts[IND(dirs .+ 2)]
+            grid.array[bnds(dirs)] = gh
         end
     end
     return grid
@@ -197,11 +198,10 @@ function exchange_ghosts(domain::Domain{D,T}) where {D,T}
                 ghosts[IND(dirs .+ 2)] = Future{Array{T,D}}(Dagger.@spawn get_ghosts(domain.grids[IND(mod1.(g + dirs, ngrids))].thunk,
                                                                                      dirs))
             else
-                ghosts[IND(dirs .+ 2)] = Future{Array{T,D}}(Dagger.@spawn zeros(T, ntuple(d -> 0, D)))
+                ghosts[IND(dirs .+ 2)] = Future{Array{T,D}}(zeros(T, ntuple(d -> 0, D)))
             end
         end
-        grids[IND(g)] = Future{Grid{D,T}}(Dagger.@spawn set_ghosts!(domain.grids[IND(g)].thunk,
-                                                                    Array{T,D}[fetch(ghost) for ghost in ghosts]))
+        grids[IND(g)] = Future{Grid{D,T}}(Dagger.@spawn set_ghosts!(domain.grids[IND(g)].thunk, ghosts))
     end
     return Domain{D,T}(grids)
 end
@@ -219,7 +219,7 @@ function maxabs(domain::Domain{D,T}) where {D,T}
     for gj in 1:ngrids[2], gi in 1:ngrids[1]
         push!(thunks, Future{T}(Dagger.@spawn maxabs(domain.grids[gi, gj].thunk)))
     end
-    res = maximum(fetch.(thunks))
+    res = maximum(fetch(th) for th in thunks)
     return res
 end
 
