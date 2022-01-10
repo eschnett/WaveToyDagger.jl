@@ -53,7 +53,7 @@ VEC(i::CartesianIndex) = SVector(Tuple(i))
 const vones = SVector(ntuple(d -> 1, D))
 
 const npoints = SVector(ntuple(d -> 256, D))
-const ngrids = SVector(ntuple(d -> 8, D))
+const ngrids = SVector(ntuple(d -> 2, D))
 const nghosts = SVector(ntuple(d -> 1, D))
 @assert all(npoints .% ngrids .== 0)
 
@@ -86,31 +86,28 @@ xcoord(ipos::SVector{D,Int}) = linterp(1 .+ nghosts, xmin, gsh - nghosts .+ 1, x
 
 ################################################################################
 
-struct Grid{D,T}
+mutable struct Grid{D,T}
     array::Array{T,D}
     gpos::SVector{D,Int}
 end
+Base.ndims(::Grid{D}) where {D} = D
 Base.eltype(::Type{Grid{D,T}}) where {D,T} = T
-Base.similar(domain::Grid{D,T}) where {D,T} = Grid{D,T}(similar(grid.array), grid.gpos)
+Base.size(grid::Grid) = size(grid.array)
+Base.similar(grid::Grid{D}, ::Type{T}=eltype(grid)) where {D,T} = Grid{D,T}(similar(grid.array), grid.gpos)
 
-struct Domain{D,S,T}
+mutable struct Domain{D,S,T}
     grids::Array{Future{Grid{D,T}},D}
     time::S
 end
+Base.ndims(::Domain{D}) where {D} = D
 Base.eltype(::Type{Domain{D,S,T}}) where {D,S,T} = T
-Base.similar(domain::Domain{D,S,T}) where {D,S,T} = Domain{D,S,T}(similar(domain.grids), domain.time)
+function Base.similar(domain::Domain{D,S}, ::Type{T}=eltype(domain)) where {D,S,T}
+    ## Dagger.@spawn
+    return Domain{D,S,T}([Future{Grid{D,T}}(Just{Grid{D,T}}(similar(fetch(grid)))) for grid in domain.grids], domain.time)
+end
 
 Base.wait(dom::Domain) = wait.(dom.grids)
 
-# @inline function Base.map!(f, r::Grid{D}, x::Grid{D}, ys::Grid{D}...) where {D}
-#     @assert r.gpos == x.gpos && all(r.gpos == y.gpos for y in ys)
-#     map!(f, r.array, x.array, (y.array for y in ys)...)
-#     return r
-# end
-# @inline function Base.map(f, x::Grid{D}, ys::Grid{D}...) where {D}
-#     @assert all(x.gpos == y.gpos for y in ys)
-#     return Grid{D}(map(f, x.array, (y.array for y in ys)...), x.gpos)
-# end
 @generated function Base.map!(f, r::Grid{D}, x::Grid{D}, ys::Grid{D}...) where {D}
     quote
         $((:(@assert x.gpos == ys[$i].gpos) for i in 1:length(ys))...)
@@ -128,6 +125,12 @@ end
     end
 end
 
+@inline function Base.map!(f, r::Domain{D,S}, x::Domain{D,S}, ys::Domain{D,S}...) where {D,S}
+    f′(xs′...) = map!(f, (fetch(x′) for x′ in xs′)...)
+    foreach(f′, r.grids, x.grids, (y.grids for y in ys)...)
+    r.time = f(x.time, (y.time for y in ys)...)
+    return r
+end
 @inline function Base.map(f, x::Domain{D,S}, ys::Domain{D,S}...) where {D,S}
     function f′(xs′...)
         grid = map(f, (fetch(x′) for x′ in xs′)...)
@@ -188,8 +191,11 @@ function initialize_domain(::Type{Domain{D,S,T}}, time::S) where {D,S,T}
     return Domain{D,S,T}(grids, time)
 end
 
-function rhs(grid::Grid{D,T}) where {T}
-    array = Array{T,D}(undef, Tuple(lsh))
+function rhs_intr(res::Grid{D,T}, grid::Grid{D,T}) where {D,T}
+    array = res.array
+    if size(array) ≠ size(grid.array)
+        array = similar(grid.array)
+    end
     @assert D == 3
     di = SVector(CartesianIndex(1, 0, 0), CartesianIndex(0, 1, 0), CartesianIndex(0, 0, 1))
     for i in intr
@@ -207,12 +213,20 @@ function rhs(grid::Grid{D,T}) where {T}
     return Grid{D,T}(array, grid.gpos)
 end
 
-function rhs(domain::Domain{D,S,T}) where {D,S,T}
-    grids = Array{Future{Grid{D,T}},D}(undef, Tuple(ngrids))
+function rhs_intr(res::Domain{D,S,T}, domain::Domain{D,S,T}, cache::Ref{Any}) where {D,S,T}
+    grids = res.grids
+    if size(grids) ≠ size(res.grids)
+        grids = similar(res.grids)
+    end
+    if !(typeof(cache[]) isa Array{Future{Grid{D,T}},D} && size(cache[]) == size(domain.grids))
+        cache[] = similar(domain).grids
+    end
+    arrays = cache[]
     for gi in IND(vones):IND(ngrids)
         g = VEC(gi)
-        ## grids[IND(g)] = Future{Grid{D,T}}(Dagger.@spawn rhs(domain.grids[IND(g)].thunk))
-        grids[IND(g)] = Future{Grid{D,T}}(Just(rhs(fetch(domain.grids[IND(g)]))))
+        res = arrays[IND(g)]
+        ## grids[IND(g)] = Future{Grid{D,T}}(Dagger.@spawn rhs_intr(domain.grids[IND(g)].thunk))
+        grids[IND(g)] = Future{Grid{D,T}}(Just(rhs_intr(fetch(res), fetch(domain.grids[IND(g)]))))
     end
     return Domain{D,S,T}(grids, S(1))
 end
@@ -284,23 +298,46 @@ end
 
 ################################################################################
 
-function rhs′(dom::Domain)
-    domrhs = rhs(dom)
-    domrhs = exchange_ghosts(domrhs)
-    return domrhs
+function rhs(res::Domain{D,S,T}, dom::Domain{D,S,T}, cache::Ref{Any}) where {D,S,T}
+    res = rhs_intr(res, dom, cache)
+    res = exchange_ghosts(res)
+    return res
 end
 
-function rk2(f, u, h)
-    u0 = u
-    k1 = f(u0)
-    # u1 = u0 + (h / 2) * k1
-    u1 = map((u0, k1) -> u0 + (h / 2) * k1, u0, k1)
-    # u1 = similar(u0)
-    # map!((u0, k1) -> u0 + (h / 2) * k1, u1, u0, k1)
-    k2 = f(u1)
-    # r = u + h * k2
-    r = map((u, k2) -> u + h * k2, u, k2)
-    return r
+# function rk2(f, u0, h)
+#     k1 = f(u0)
+#     u1 = u0 + (h / 2) * k1
+#     k2 = f(u1)
+#     u2 = u0 + h * k2
+#     return u2
+# end
+
+# function rk2(f, u0, h)
+#     k1 = f(u0)
+#     u1 = map((u0, k1) -> u0 + (h / 2) * k1, u0, k1)
+#     k2 = f(u1)
+#     u2 = map((u0, k2) -> u0 + h * k2, u0, k2)
+#     return u2
+# end
+
+struct rk2Cache{V}
+    k1::V
+    u1::V
+    k2::V
+    fcache::Ref{Any}
+end
+function rk2(u2::V, f, u0::V, h, cache::Ref{Any}) where {V}
+    if !(cache[] isa rk2Cache{V})
+        cache[] = rk2Cache{V}(similar(u0), similar(u0), similar(u0), Ref{Any}(nothing))
+    end
+    k1, u1, k2, fcache = cache[].k1, cache[].u1, cache[].k2, cache[].fcache
+
+    k1 = f(k1, u0, fcache)
+    map!((u0, k1) -> u0 + (h / 2) * k1, u1, u0, k1)
+    k2 = f(k2, u1, fcache)
+    map!((u0, k2) -> u0 + h * k2, u2, u0, k2)
+
+    return u2
 end
 
 function main()
@@ -311,24 +348,23 @@ function main()
     S = Float64
     T = SVector{D + 2,S}
     h = minimum(dx) / 2
-    @show xmin xmax dx h
     niters = 10
 
     println("Initial conditions...")
     t = S(0)
     dom = initialize_domain(Domain{D,S,T}, t)
     dom = exchange_ghosts(dom)
-    err = calc_error(dom)
-    ma = maxabs(err)
-    println("maxabs[error]=$ma")
+
+    rhscache = Ref{Any}(nothing)
+    dom′ = similar(dom)
 
     for iter in 1:niters
         println("Iteration $iter...")
-        dom′ = dom
-        dom = rk2(rhs′, dom, h)
+        dom′ = rk2(dom′, rhs, dom, h, rhscache)
 
         # Limit parallelism
-        wait(dom′)
+        wait(dom)
+        dom, dom′ = dom′, dom
     end
 
     # TODO: Use `yield` (?) to show a progress bar or something
