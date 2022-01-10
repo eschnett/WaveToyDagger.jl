@@ -81,7 +81,7 @@ end
 
 const xmin = SVector{D}(-1.0 for d in 1:D)
 const xmax = SVector{D}(+1.0 for d in 1:D)
-const dx = (xmax - xmin) / (gsh - 2 * nghosts)
+const dx = (xmax - xmin) ./ npoints
 xcoord(ipos::SVector{D,Int}) = linterp(1 .+ nghosts, xmin, gsh - nghosts .+ 1, xmax, ipos)
 
 ################################################################################
@@ -155,12 +155,13 @@ Base.:*(a::Number, x::Domain) = map(b -> a * b, x)
 
 function solution(t::S, x::SVector{D,S}) where {D,S}
     @assert D == 3
-    ω = sqrt(S(D))
-    u = cospi(ω * t) * sinpi(x[1]) * sinpi(x[2]) * sinpi(x[3])
-    ρ = -S(π) * ω * sinpi(ω * t) * sinpi(x[1]) * sinpi(x[2]) * sinpi(x[3])
-    v = SVector(S(π) * cospi(ω * t) * cospi(x[1]) * sinpi(x[2]) * sinpi(x[3]),
-                S(π) * cospi(ω * t) * sinpi(x[1]) * cospi(x[2]) * sinpi(x[3]),
-                S(π) * cospi(ω * t) * sinpi(x[1]) * sinpi(x[2]) * cospi(x[3]))
+    k = SVector{D,S}(1, 1, 1)
+    ω = sqrt(sum(k .^ 2))
+    u = cospi(ω * t) * sinpi(k[1] * x[1]) * sinpi(k[2] * x[2]) * sinpi(k[3] * x[3])
+    ρ = -S(π) * ω * sinpi(ω * t) * sinpi(k[1] * x[1]) * sinpi(k[2] * x[2]) * sinpi(k[3] * x[3])
+    v = SVector(S(π) * k[1] * cospi(ω * t) * cospi(k[1] * x[1]) * sinpi(k[2] * x[2]) * sinpi(k[3] * x[3]),
+                S(π) * k[2] * cospi(ω * t) * sinpi(k[1] * x[1]) * cospi(k[2] * x[2]) * sinpi(k[3] * x[3]),
+                S(π) * k[3] * cospi(ω * t) * sinpi(k[1] * x[1]) * sinpi(k[2] * x[2]) * cospi(k[3] * x[3]))
     return SVector(u, ρ, v...)
 end
 
@@ -310,14 +311,12 @@ function main()
     S = Float64
     T = SVector{D + 2,S}
     h = minimum(dx) / 2
+    @show xmin xmax dx h
     niters = 10
 
     println("Initial conditions...")
     t = S(0)
     dom = initialize_domain(Domain{D,S,T}, t)
-    err = calc_error(dom)
-    ma = maxabs(err)
-    println("maxabs[error]=$ma")
     dom = exchange_ghosts(dom)
     err = calc_error(dom)
     ma = maxabs(err)
